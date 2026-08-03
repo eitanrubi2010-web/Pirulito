@@ -1,0 +1,6 @@
+# Unica dependencia obligatoria: el screener de TradingView se consulta por HTTP.
+requests>=2.28
+
+# Opcional, solo para `--history --provider tradingview` y el backtest con datos
+# reales. No esta en PyPI, se instala desde GitHub:
+#   pip install git+https://github.com/rongardF/tvdatafeed.git

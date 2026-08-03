@@ -1,0 +1,258 @@
+//@version=5
+// Pirulito — puntaje compuesto multi-factor
+//
+// La misma logica que el motor de Python, corriendo dentro de TradingView.
+// Combina ocho senales, cada una normalizada a [-1, 1], en un puntaje unico
+// que se muestra de 0 a 100. Cada senal es continua, no booleana: una accion
+// 1% por encima de su media de 200 no vale lo mismo que una 30% por encima,
+// y una senal que solo salta entre dos valores hace que el puntaje tiemble
+// cada vez que el precio roza un umbral.
+//
+// Uso: pegar en Pine Editor -> Add to chart. Timeframe diario recomendado.
+// No es asesoramiento financiero.
+
+indicator("Pirulito — Puntaje de Compra", shorttitle="Pirulito", overlay=false, precision=1)
+
+// ─────────────────────────────── Entradas ────────────────────────────────
+
+grpP = "Periodos"
+smaFastLen  = input.int(50,  "SMA rapida",        minval=2,  group=grpP)
+smaSlowLen  = input.int(200, "SMA lenta",         minval=5,  group=grpP)
+rsiLen      = input.int(14,  "RSI",               minval=2,  group=grpP)
+macdFast    = input.int(12,  "MACD rapida",       minval=2,  group=grpP)
+macdSlow    = input.int(26,  "MACD lenta",        minval=3,  group=grpP)
+macdSig     = input.int(9,   "MACD senal",        minval=2,  group=grpP)
+atrLen      = input.int(14,  "ATR",               minval=2,  group=grpP)
+momWindow   = input.int(252, "Ventana momentum",  minval=30, group=grpP)
+momSkip     = input.int(21,  "Salto momentum",    minval=0,  group=grpP)
+volWindow   = input.int(252, "Ventana volatilidad", minval=30, group=grpP)
+highWindow  = input.int(252, "Ventana maximos",   minval=30, group=grpP)
+volShort    = input.int(20,  "Volumen corto",     minval=2,  group=grpP)
+volBase     = input.int(60,  "Volumen base",      minval=5,  group=grpP)
+qualityLen  = input.int(120, "Ventana regresion", minval=20, group=grpP)
+
+grpW = "Pesos"
+wTrend    = input.float(0.20, "Tendencia",       minval=0, step=0.01, group=grpW)
+wMomentum = input.float(0.18, "Momentum",        minval=0, step=0.01, group=grpW)
+wMacd     = input.float(0.11, "MACD",            minval=0, step=0.01, group=grpW)
+wRsi      = input.float(0.09, "RSI",             minval=0, step=0.01, group=grpW)
+wSharpe   = input.float(0.14, "Ajustado a riesgo", minval=0, step=0.01, group=grpW)
+wHigh     = input.float(0.10, "Cerca de maximos", minval=0, step=0.01, group=grpW)
+wVolume   = input.float(0.05, "Volumen",         minval=0, step=0.01, group=grpW)
+wQuality  = input.float(0.06, "Calidad de tendencia", minval=0, step=0.01, group=grpW)
+
+grpR = "Riesgo y umbrales"
+riskFree     = input.float(0.04, "Tasa libre de riesgo", step=0.005, group=grpR)
+maxVol       = input.float(0.75, "Volatilidad anual maxima", step=0.05, group=grpR)
+maxDrawdown  = input.float(0.35, "Caida maxima desde maximos", step=0.05, group=grpR)
+thStrongBuy  = input.float(0.35, "Umbral compra fuerte", step=0.05, group=grpR)
+thBuy        = input.float(0.15, "Umbral compra",        step=0.05, group=grpR)
+thReduce     = input.float(-0.15, "Umbral reducir",      step=0.05, group=grpR)
+thSell       = input.float(-0.35, "Umbral venta",        step=0.05, group=grpR)
+atrStopMult  = input.float(2.5,  "Multiplo de ATR para el stop", minval=0.5, step=0.1, group=grpR)
+
+grpD = "Visualizacion"
+showTable = input.bool(true, "Mostrar tabla de senales", group=grpD)
+showRisk  = input.bool(true, "Aplicar controles de riesgo", group=grpD)
+
+// ─────────────────────────────── Utilidades ──────────────────────────────
+
+// Pine no trae math.tanh, asi que se arma con exponenciales. El clamp
+// interno evita que math.exp se desborde con entradas grandes.
+squash(x, scale) =>
+    z = math.max(math.min(x / scale, 10.0), -10.0)
+    e = math.exp(2.0 * z)
+    (e - 1.0) / (e + 1.0)
+
+clamp(x, lo, hi) => math.max(lo, math.min(hi, x))
+
+// ─────────────────────────────── Indicadores ─────────────────────────────
+
+smaFast = ta.sma(close, smaFastLen)
+smaSlow = ta.sma(close, smaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+
+[macdLine, signalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSig)
+atrVal = ta.atr(atrLen)
+
+ret       = close / close[1] - 1.0
+annReturn = ta.sma(ret, volWindow) * 252.0
+annVol    = ta.stdev(ret, volWindow) * math.sqrt(252.0)
+sharpe    = annVol > 0 ? (annReturn - riskFree) / annVol : na
+
+high52 = ta.highest(close, highWindow)
+low52  = ta.lowest(close, highWindow)
+
+volShortAvg = ta.sma(volume, volShort)
+volBaseAvg  = ta.sma(volume, volBase)
+relVolume   = volBaseAvg > 0 ? volShortAvg / volBaseAvg : na
+priceChange = close / close[volShort] - 1.0
+
+logClose  = math.log(close)
+regNow    = ta.linreg(logClose, qualityLen, 0)
+regPrev   = ta.linreg(logClose, qualityLen, 1)
+slopeAnn  = (regNow - regPrev) * 252.0
+corr      = ta.correlation(logClose, bar_index, qualityLen)
+r2        = na(corr) ? na : corr * corr
+
+// ──────────────────────────────── Senales ────────────────────────────────
+
+// Tendencia: distancia entre medias (la idea del cruce dorado, pero medida
+// como distancia para que se degrade suave) mas cuanto se extendio el precio.
+trendOk = not na(smaFast) and not na(smaSlow) and smaFast > 0 and smaSlow > 0
+float sTrend = not trendOk ? na : 0.45 * squash((smaFast - smaSlow) / smaSlow, 0.06) + 0.35 * squash((close - smaSlow) / smaSlow, 0.10) + 0.20 * squash((close - smaFast) / smaFast, 0.05)
+
+// Momentum 12-1: retorno de un año que se detiene un mes antes, porque el
+// ultimo mes tiende a revertir en vez de continuar.
+momOk = bar_index >= momWindow + 1 and not na(close[momWindow]) and close[momWindow] > 0
+float momRet    = momOk ? close[momSkip] / close[momWindow] - 1.0 : na
+float sMomentum = momOk ? squash(momRet, 0.25) : na
+
+// MACD: nivel del histograma mas su pendiente. El nivel dice hacia donde se
+// inclina el momentum; la pendiente dice si esa inclinacion crece o se agota.
+float macdLevel = na(macdHist) or close <= 0 ? na : squash(macdHist / close, 0.01)
+float macdSlope = na(macdHist) or na(macdHist[5]) or close <= 0 ? na : squash((macdHist - macdHist[5]) / (5.0 * close), 0.002)
+float sMacd     = na(macdLevel) ? na : na(macdSlope) ? macdLevel : 0.6 * macdLevel + 0.4 * macdSlope
+
+// RSI: premia fuerza sana y castiga agotamiento en ambos extremos. Pico en 60
+// y cae a -1 en 20 y en 100. La direccion ya la cubren tendencia y momentum.
+float sRsi = na(rsiVal) ? na : clamp(1.0 - math.abs(rsiVal - 60.0) / 20.0, -1.0, 1.0)
+
+// Sharpe: el retorno solo premia lo que mas se movio; dividir por volatilidad
+// pregunta cuanto de ese movimiento hubo que aguantar.
+float sSharpe = na(sharpe) ? na : squash(sharpe, 1.0)
+
+// Cerca de maximos: posicion dentro del rango anual y distancia al techo.
+highOk = not na(high52) and not na(low52) and high52 > 0 and high52 != low52
+float drop  = highOk ? (high52 - close) / high52 : na
+float sHigh = not highOk ? na : 0.5 * (2.0 * ((close - low52) / (high52 - low52)) - 1.0) + 0.5 * clamp(1.0 - drop / 0.20, -1.0, 1.0)
+
+// Volumen: un pico solo es alcista si el precio subio con el. El mismo pico
+// contra un precio que cae es distribucion, asi que la direccion cambia el
+// signo en vez de solo escalar la magnitud.
+float sVolume = na(relVolume) or na(priceChange) ? na : squash(relVolume - 1.0, 0.4) * clamp(priceChange / 0.05, -1.0, 1.0)
+
+// Calidad: que tan limpio sigue el precio su propia recta, no cuan lejos
+// llego. Separa una subida sostenida de otra igual de rentable pero violenta.
+float sQuality = na(r2) or na(slopeAnn) ? na : squash(slopeAnn, 0.20) * r2
+
+// ─────────────────────────── Puntaje compuesto ───────────────────────────
+// Promedio ponderado sobre las senales disponibles: si a una le faltan datos
+// se reparte su peso entre las demas en vez de contarla como neutral.
+
+contrib(value, weight) => na(value) ? 0.0 : value * weight
+usedWeight(value, weight) => na(value) ? 0.0 : weight
+
+weighted = contrib(sTrend, wTrend) + contrib(sMomentum, wMomentum) + contrib(sMacd, wMacd) + contrib(sRsi, wRsi) + contrib(sSharpe, wSharpe) + contrib(sHigh, wHigh) + contrib(sVolume, wVolume) + contrib(sQuality, wQuality)
+
+totalW = usedWeight(sTrend, wTrend) + usedWeight(sMomentum, wMomentum) + usedWeight(sMacd, wMacd) + usedWeight(sRsi, wRsi) + usedWeight(sSharpe, wSharpe) + usedWeight(sHigh, wHigh) + usedWeight(sVolume, wVolume) + usedWeight(sQuality, wQuality)
+
+score    = totalW > 0 ? clamp(weighted / totalW, -1.0, 1.0) : na
+score100 = na(score) ? na : (score + 1.0) * 50.0
+coverage = totalW / (wTrend + wMomentum + wMacd + wRsi + wSharpe + wHigh + wVolume + wQuality)
+
+// ──────────────────────── Controles de riesgo ────────────────────────────
+// Un puntaje alto no alcanza: una accion demasiado volatil o demasiado lejos
+// de sus maximos baja un escalon por cada control que incumple.
+
+currentDD = not na(high52) and high52 > 0 ? math.max(0.0, (high52 - close) / high52) : na
+
+volBreach = showRisk and not na(annVol) and annVol > maxVol
+ddBreach  = showRisk and not na(currentDD) and currentDD > maxDrawdown
+penalties = (volBreach ? 1 : 0) + (ddBreach ? 1 : 0)
+
+rawRank = na(score) ? 2 : score >= thStrongBuy ? 0 : score >= thBuy ? 1 : score <= thSell ? 4 : score <= thReduce ? 3 : 2
+rank    = math.min(rawRank + penalties, 4)
+
+verdictText(r) =>
+    r == 0 ? "COMPRA FUERTE" : r == 1 ? "COMPRA" : r == 2 ? "MANTENER" : r == 3 ? "REDUCIR" : "VENTA"
+
+verdictColor(r) =>
+    r == 0 ? color.new(color.green, 0) : r == 1 ? color.new(color.lime, 0) : r == 2 ? color.new(color.gray, 0) : r == 3 ? color.new(color.orange, 0) : color.new(color.red, 0)
+
+// ─────────────────────────────── Graficos ────────────────────────────────
+
+scoreColor = verdictColor(rank)
+plot(score100, "Puntaje", color=scoreColor, linewidth=2)
+
+hline(50, "Neutral", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+buyLine       = hline((thBuy + 1.0) * 50.0, "Compra", color=color.new(color.green, 60), linestyle=hline.style_dashed)
+strongBuyLine = hline((thStrongBuy + 1.0) * 50.0, "Compra fuerte", color=color.new(color.green, 30), linestyle=hline.style_dashed)
+reduceLine    = hline((thReduce + 1.0) * 50.0, "Reducir", color=color.new(color.red, 60), linestyle=hline.style_dashed)
+sellLine      = hline((thSell + 1.0) * 50.0, "Venta", color=color.new(color.red, 30), linestyle=hline.style_dashed)
+
+fill(buyLine, strongBuyLine, color=color.new(color.green, 92))
+fill(reduceLine, sellLine, color=color.new(color.red, 92))
+
+// ──────────────────────────────── Tabla ──────────────────────────────────
+
+// str.tostring no admite un "+" en la mascara, asi que el signo positivo
+// se antepone a mano para que la columna quede alineada.
+signPrefix(value) => na(value) ? "" : value >= 0 ? "+" : ""
+fmtSignal(value) => na(value) ? "n/d" : signPrefix(value) + str.tostring(value, "0.00")
+
+// Pine no admite declarar funciones dentro de un bloque `if`, asi que la
+// fila de la tabla se define aca arriba y recibe la tabla como argumento.
+addRow(t, row, label, value, weight) =>
+    table.cell(t, 0, row, label)
+    table.cell(t, 1, row, fmtSignal(value), text_color=na(value) ? color.gray : value >= 0 ? color.green : color.red)
+    table.cell(t, 2, row, str.tostring(weight, "0.00"), text_color=color.gray)
+    table.cell(t, 3, row, na(value) ? "—" : signPrefix(value * weight) + str.tostring(value * weight, "0.000"))
+
+// El stop se separa del precio por multiplos de ATR, asi que una accion mas
+// volatil recibe un stop mas ancho en vez de uno arbitrariamente cercano.
+stopPrice   = na(atrVal) ? na : close - atrStopMult * atrVal
+riskPerUnit = na(stopPrice) ? na : close - stopPrice
+
+var table t = table.new(position.top_right, 4, 13, border_width=1)
+
+if showTable and barstate.islast
+    table.cell(t, 0, 0, "Pirulito", bgcolor=color.new(color.blue, 20), text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 0, na(score100) ? "n/d" : str.tostring(score100, "0.0") + "/100", bgcolor=color.new(color.blue, 20), text_color=color.white)
+    table.cell(t, 2, 0, verdictText(rank), bgcolor=verdictColor(rank), text_color=color.white)
+    table.cell(t, 3, 0, "cob " + str.tostring(coverage * 100, "0") + "%", bgcolor=color.new(color.blue, 20), text_color=color.white)
+
+    table.cell(t, 0, 1, "Senal", text_color=color.gray)
+    table.cell(t, 1, 1, "Valor", text_color=color.gray)
+    table.cell(t, 2, 1, "Peso", text_color=color.gray)
+    table.cell(t, 3, 1, "Aporte", text_color=color.gray)
+
+    addRow(t, 2, "Tendencia",  sTrend,    wTrend)
+    addRow(t, 3, "Momentum",   sMomentum, wMomentum)
+    addRow(t, 4, "MACD",       sMacd,     wMacd)
+    addRow(t, 5, "RSI",        sRsi,      wRsi)
+    addRow(t, 6, "Sharpe",     sSharpe,   wSharpe)
+    addRow(t, 7, "Cerca max.", sHigh,     wHigh)
+    addRow(t, 8, "Volumen",    sVolume,   wVolume)
+    addRow(t, 9, "Calidad",    sQuality,  wQuality)
+
+    table.cell(t, 0, 10, "Vol. anual")
+    table.cell(t, 1, 10, na(annVol) ? "n/d" : str.tostring(annVol * 100, "0.0") + "%", text_color=volBreach ? color.red : color.gray)
+    table.cell(t, 2, 10, "Caida")
+    table.cell(t, 3, 10, na(currentDD) ? "n/d" : "-" + str.tostring(currentDD * 100, "0.0") + "%", text_color=ddBreach ? color.red : color.gray)
+
+    table.cell(t, 0, 11, "Stop (ATR)")
+    table.cell(t, 1, 11, na(stopPrice) ? "n/d" : str.tostring(stopPrice, format.mintick), text_color=color.gray)
+    table.cell(t, 2, 11, "Riesgo/accion")
+    table.cell(t, 3, 11, na(riskPerUnit) ? "n/d" : str.tostring(riskPerUnit, format.mintick), text_color=color.gray)
+
+    table.cell(t, 0, 12, penalties > 0 ? "Riesgo: veredicto rebajado" : "Riesgo: sin observaciones", text_color=penalties > 0 ? color.orange : color.gray)
+    table.cell(t, 1, 12, "")
+    table.cell(t, 2, 12, "")
+    table.cell(t, 3, 12, "")
+
+// ──────────────────────────────── Alertas ────────────────────────────────
+
+enteredBuy    = rank <= 1 and rank[1] > 1
+enteredStrong = rank == 0 and rank[1] != 0
+exitedBuy     = rank > 1 and rank[1] <= 1
+enteredSell   = rank >= 3 and rank[1] < 3
+
+alertcondition(enteredBuy,    "Entra en zona de compra", "Pirulito: {{ticker}} entro en zona de COMPRA")
+alertcondition(enteredStrong, "Compra fuerte",           "Pirulito: {{ticker}} paso a COMPRA FUERTE")
+alertcondition(exitedBuy,     "Sale de zona de compra",  "Pirulito: {{ticker}} salio de la zona de compra")
+alertcondition(enteredSell,   "Zona de venta",           "Pirulito: {{ticker}} entro en zona de VENTA/REDUCIR")
+
+// Serie exportable: al agregar este indicador al screener de TradingView se
+// puede filtrar y ordenar por esta columna.
+plot(score100, "Pirulito Score", display=display.data_window)

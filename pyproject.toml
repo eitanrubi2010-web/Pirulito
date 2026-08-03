@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pirulito"
+version = "0.1.0"
+description = "Seguimiento y puntuacion de acciones con datos de TradingView"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.28"]
+
+[project.scripts]
+pirulito = "pirulito.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pirulito*"]
